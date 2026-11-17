@@ -1,0 +1,318 @@
+from __future__ import annotations
+
+import json
+import re
+import urllib.request
+from typing import Any
+
+from rdflib import OWL, RDF, RDFS, Graph, Namespace, URIRef
+
+from ..adapters import AdapterError
+from ..models import ADDITIVITY, METRIC_FIELDS, Finding, ValidationReport
+from ..ontology import ROOT_CLASSES, classes, has_license, is_metric_class, load_content, local, relations
+from ..project import Project, read_yaml, write_text_atomic
+from .contracts import contradictions, observe_join
+from .neo4j_values import reserved_problem
+from .profile import load_profile
+
+OOPS_REST = "https://oops.linkeddata.es/rest"
+OEG_STATUS = "https://raw.githubusercontent.com/oeg-upm/oeg-service-status/main/services_status.json"
+OOPS = Namespace("http://oops.linkeddata.es/def#")
+
+
+def _parse_ttl(project: Project, findings: list[Finding]) -> Graph | None:
+    g = Graph()
+    try:
+        g.parse(project.schema_path, format="turtle")
+    except Exception as exc:
+        findings.append(Finding(level="error", check="ttl_parse", message=f"schema.ttl nao parseia: {exc}"))
+        return None
+    return g
+
+
+def _check_terms(content: dict[str, Any], names: set[str], findings: list[Finding]) -> None:
+    for t in content["terms"]:
+        if t.get("class") not in names:
+            findings.append(Finding(level="error", check="term_class", subject=t.get("name", ""),
+                                    message=f"termo '{t.get('name')}' aponta para classe inexistente '{t.get('class')}'"))
+
+
+def _check_mappings(content: dict[str, Any], project: Project, findings: list[Finding]) -> dict[str, Any]:
+    prof = load_profile(project)
+    term_names = {t["name"] for t in content["terms"]}
+    for m in content["mappings"]:
+        if m.get("term") not in term_names:
+            findings.append(Finding(level="error", check="mapping_term", subject=m.get("term", ""),
+                                    message=f"mapping aponta para termo inexistente '{m.get('term')}'"))
+    if prof is None:
+        findings.append(Finding(level="warning", check="profile_missing",
+                                message="docs/profile.json nao existe; rode akme profile para checar mappings e cobertura"))
+        return {"available": False}
+    columns = {(s.name, c.name) for s in prof.sources for c in s.columns}
+    mapped = set()
+    for m in content["mappings"]:
+        key = (m.get("source"), m.get("column"))
+        if key not in columns:
+            findings.append(Finding(level="error", check="mapping_column", subject=m.get("term", ""),
+                                    message=f"mapping de '{m.get('term')}' aponta para coluna inexistente {key[0]}.{key[1]}"))
+        else:
+            mapped.add(key)
+    by_source = {}
+    for s in prof.sources:
+        cols = [c.name for c in s.columns]
+        covered = [c for c in cols if (s.name, c) in mapped]
+        by_source[s.name] = {"columns": len(cols), "mapped": len(covered),
+                             "unmapped": [c for c in cols if c not in covered]}
+    total = sum(v["columns"] for v in by_source.values())
+    done = sum(v["mapped"] for v in by_source.values())
+    return {"available": True, "columns": total, "mapped": done,
+            "ratio": round(done / total, 3) if total else 0.0, "by_source": by_source}
+
+
+def _check_source_classes(g: Graph, content: dict[str, Any], findings: list[Finding]) -> None:
+    """Cada tabela vira uma classe no grafo. Termos de classes diferentes na mesma tabela quase sempre sao um
+    mapping apontando para a tabela errada; avisa aqui, na etapa 3, o que a carga no Neo4j recusaria na etapa 5."""
+    term_class = {t["name"]: t.get("class") for t in content["terms"]}
+    by_source: dict[str, dict[str, list[str]]] = {}
+    for c in content["relation_contracts"]:
+        if c.get("join"):
+            for side, cls in (("from", c.get("domain")), ("to", c.get("range"))):
+                by_source.setdefault(c["join"][side]["source"], {}).setdefault(cls, []).append(f"relacao {c.get('relation')}")
+    for m in content["mappings"]:
+        cls = term_class.get(m.get("term"))
+        if cls and m.get("role") != "metric" and not is_metric_class(g, cls):
+            by_source.setdefault(m.get("source"), {}).setdefault(cls, []).append(f"termo {m.get('term')}")
+    for source, options in sorted(by_source.items()):
+        if len(options) < 2:
+            continue
+        parts = "; ".join(f"{cls} ({', '.join(sorted(set(who)))})" for cls, who in sorted(options.items()))
+        findings.append(Finding(level="warning", check="source_classes", subject=source,
+                                message=f"a tabela {source} recebe termos de mais de uma classe: {parts}. Cada tabela vira "
+                                        "uma classe; corrija com update_mapping ou remove_mapping"))
+
+
+def _check_relation_contracts(g: Graph, content: dict[str, Any], project: Project, findings: list[Finding],
+                              check_data: bool = True) -> None:
+    contracts = content["relation_contracts"]
+    covered = {c["relation"] for c in contracts} | {c.get("inverse_of") for c in contracts if c.get("inverse_of")}
+    for r in relations(g):
+        if r["name"] not in covered:
+            findings.append(Finding(level="warning", check="relation_without_contract", subject=r["name"],
+                                    message=f"relacao '{r['name']}' sem multiplicidade nem join declarados"))
+    for c in contracts:
+        if not c.get("join") or not check_data:
+            continue
+        try:
+            observed = observe_join(project, c["join"])
+        except AdapterError as exc:
+            findings.append(Finding(level="warning", check="join_check_unavailable", subject=c["relation"],
+                                    message=f"nao foi possivel ler o dado do join de '{c['relation']}': {exc}"))
+            continue
+        if not observed["available"]:
+            findings.append(Finding(level="error", check="join_broken", subject=c["relation"],
+                                    message=f"join de '{c['relation']}' quebrado: {observed['reason']}"))
+            continue
+        for problem in contradictions(c["multiplicity"], observed):
+            level = "warning" if c.get("override_reason") else "error"
+            findings.append(Finding(level=level, check="multiplicity_mismatch", subject=c["relation"],
+                                    message=f"'{c['relation']}' declarada {c['multiplicity']}, observada "
+                                            f"{observed['multiplicity']}: {problem}"))
+        if observed["orphans"]:
+            hint = " (amostra truncada: pode ser falso positivo)" if observed["truncated"] else ""
+            findings.append(Finding(level="warning", check="join_orphans", subject=c["relation"],
+                                    message=f"'{c['relation']}': {observed['orphans']} chaves de "
+                                            f"{c['join']['from']['source']}.{c['join']['from']['column']} sem par em "
+                                            f"{c['join']['to']['source']}, ex: {observed['orphan_examples']}{hint}"))
+        if observed["from"]["nulls"]:
+            findings.append(Finding(level="warning", check="join_nulls", subject=c["relation"],
+                                    message=f"'{c['relation']}': {observed['from']['nulls']} linhas com chave nula em "
+                                            f"{c['join']['from']['source']}.{c['join']['from']['column']}"))
+
+
+def _check_metrics(g: Graph, content: dict[str, Any], findings: list[Finding]) -> None:
+    by_term: dict[str, list[dict[str, Any]]] = {}
+    for m in content["mappings"]:
+        by_term.setdefault(m.get("term", ""), []).append(m)
+    for t in content["terms"]:
+        if not t.get("class") or not is_metric_class(g, t["class"]):
+            continue
+        name = t.get("name", "")
+        missing = [f for f in METRIC_FIELDS if not str(t.get(f) or "").strip()]
+        if missing:
+            findings.append(Finding(level="error", check="metric_without_contract", subject=name,
+                                    message=f"metrica '{name}' sem {', '.join(missing)}"))
+        elif t["additivity"] not in ADDITIVITY:
+            findings.append(Finding(level="error", check="metric_without_contract", subject=name,
+                                    message=f"metrica '{name}' com additivity invalida: {t['additivity']}"))
+        for m in by_term.get(name, []):
+            if not str(m.get("expression") or "").strip():
+                findings.append(Finding(level="error", check="metric_without_expression", subject=name,
+                                        message=f"mapping de '{name}' em {m.get('source')} sem expression"))
+
+
+def _check_precedence(content: dict[str, Any], findings: list[Finding]) -> None:
+    seen: dict[str, tuple[str, str]] = {}
+    for r in content["precedence"]:
+        pair = (str(r.get("winner")), str(r.get("over")))
+        key = r.get("topic", "")
+        if key in seen and seen[key] == (pair[1], pair[0]):
+            findings.append(Finding(level="error", check="precedence_conflict", subject=key,
+                                    message=f"precedencia contraditoria para '{key}': {pair[0]} sobre {pair[1]} e o inverso"))
+        seen[key] = pair
+
+
+def _check_reserved_names(g: Graph, content: dict[str, Any], findings: list[Finding]) -> None:
+    """Nomes que o akme usa no Neo4j (Conceito, Termo, RELACAO_ONTOLOGIA, _id...): a carga recusaria. Aviso, nao
+    erro, porque os outros alvos de publicacao aceitam."""
+    found = ([(c["name"], reserved_problem("class", c["name"])) for c in classes(g)]
+             + [(r["name"], reserved_problem("relation", r["name"])) for r in relations(g)]
+             + [(f"{m.get('source')}.{m.get('column')}", reserved_problem("column", str(m.get("column") or "")))
+                for m in content["mappings"]])
+    for subject, problem in dict.fromkeys(found):
+        if problem:
+            findings.append(Finding(level="warning", check="reserved_name", subject=subject,
+                                    message=problem + "; a exportacao para o Neo4j recusa este nome"))
+
+
+def _check_questions(content: dict[str, Any], project: Project, findings: list[Finding]) -> None:
+    status = {c.get("id"): c.get("status") for c in content["requirements"]["competency_questions"]}
+    for q in read_yaml(project.questions_path).get("questions") or []:
+        if q.get("id") and (q["id"] not in status or status[q["id"]] != "reserved"):
+            findings.append(Finding(level="warning", check="question_without_requirement", subject=q["id"],
+                                    message=f"pergunta '{q['id']}' nao corresponde a uma competency question reserved em content.yml"))
+
+
+def _check_reserved(content: dict[str, Any], findings: list[Finding]) -> None:
+    for c in content["requirements"]["competency_questions"]:
+        if c.get("status") == "reserved" and not str(c.get("answer") or "").strip():
+            findings.append(Finding(level="error", check="cq_reserved_without_answer", subject=c.get("id", ""),
+                                    message=f"CQ '{c.get('id')}' esta reserved sem answer"))
+
+
+def _check_requirements(content: dict[str, Any], findings: list[Finding]) -> None:
+    r = content["requirements"]
+    cqs = r["competency_questions"]
+    for c in cqs:
+        cid = c.get("id", "")
+        if c.get("status") == "approved" and not c.get("priority"):
+            findings.append(Finding(level="error", check="cq_approved_without_priority", subject=cid,
+                                    message=f"CQ '{cid}' esta approved sem priority"))
+        if c.get("proposed_by") == "agent" and not any(e.get("kind") == "source" for e in c.get("evidence") or []):
+            findings.append(Finding(level="error", check="cq_agent_without_source_evidence", subject=cid,
+                                    message=f"CQ '{cid}' proposta pelo agente sem evidencia kind source"))
+    if not any(c.get("status") == "reserved" for c in cqs):
+        findings.append(Finding(level="warning", check="no_reserved_cq",
+                                message="nenhuma CQ reserved: eval nao testa pelo resultado"))
+    for item in list(r["gaps"]) + list(r["divergences"]):
+        if item.get("decision") == "open":
+            findings.append(Finding(level="warning", check="open_gap_or_divergence", subject=item.get("id", ""),
+                                    message=f"'{item.get('id')}' segue em open"))
+
+
+def native_pitfalls(g: Graph) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    cls = classes(g)
+    rels = relations(g)
+    connected = {n for r in rels for n in r["domain"] + r["range"]}
+    connected |= {p for c in cls for p in c["subclass_of"]}
+    for c in cls:
+        if c["name"] not in ROOT_CLASSES and not c["subclass_of"] and c["name"] not in connected:
+            out.append(_pitfall("P04", "important", c["name"], "classe sem subClassOf nem relacoes"))
+        if not c["label"] or not c["comment"]:
+            out.append(_pitfall("P08", "minor", c["name"], "classe sem rdfs:label ou rdfs:comment"))
+        if not re.fullmatch(r"[A-Z][A-Za-z0-9]*", c["name"]):
+            out.append(_pitfall("P22", "minor", c["name"], "nome de classe fora do padrao PascalCase"))
+    for r in rels:
+        if not r["domain"] or not r["range"]:
+            out.append(_pitfall("P11", "important", r["name"], "propriedade sem domain ou range"))
+        if not r["label"]:
+            out.append(_pitfall("P08", "minor", r["name"], "propriedade sem rdfs:label"))
+        if not r["inverse_of"]:
+            out.append(_pitfall("P13", "minor", r["name"], "relacao sem inversa declarada"))
+        if not re.fullmatch(r"[a-z][A-Za-z0-9]*", r["name"]):
+            out.append(_pitfall("P22", "minor", r["name"], "nome de propriedade fora do padrao lowerCamelCase"))
+    if not has_license(g):
+        out.append(_pitfall("P41", "important", "ontology", "ontologia sem dcterms:license"))
+    return out
+
+
+def _pitfall(code: str, level: str, subject: str, message: str) -> dict[str, Any]:
+    return {"code": code, "level": level, "subject": subject, "message": message, "source": "native"}
+
+
+def oops_status(timeout: int = 8) -> dict[str, Any]:
+    try:
+        with urllib.request.urlopen(OEG_STATUS, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"known": False, "error": str(exc)}
+    entry = data.get("oops") if isinstance(data, dict) else None
+    if entry is None and isinstance(data, list):
+        entry = next((e for e in data if str(e.get("name", "")).lower().startswith("oops")), None)
+    if not entry:
+        return {"known": False}
+    code = entry.get("status_http_code") or entry.get("status_code")
+    return {"known": True, "http_code": code, "up": str(code) == "200"}
+
+
+def oops_scan(ttl: str, timeout: int = 30) -> dict[str, Any]:
+    status = oops_status()
+    if status.get("known") and not status.get("up"):
+        return {"available": False, "reason": f"OOPS! fora do ar segundo oeg-service-status (http {status.get('http_code')})", "pitfalls": []}
+    body = (
+        '<?xml version="1.0" encoding="UTF-8"?><OOPSRequest><OntologyUrl></OntologyUrl>'
+        f"<OntologyContent><![CDATA[{ttl}]]></OntologyContent><Pitfalls></Pitfalls>"
+        "<OutputFormat>RDF/XML</OutputFormat></OOPSRequest>"
+    ).encode("utf-8")
+    req = urllib.request.Request(OOPS_REST, data=body, headers={"Content-Type": "application/xml"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except Exception as exc:
+        return {"available": False, "reason": str(exc), "pitfalls": []}
+    g = Graph()
+    try:
+        g.parse(data=raw, format="xml")
+    except Exception as exc:
+        return {"available": False, "reason": f"resposta invalida: {exc}", "pitfalls": []}
+    pitfalls = []
+    for p in g.subjects(RDF.type, OOPS.pitfall):
+        affected = [local(a) for a in g.objects(p, OOPS.hasAffectedElement)]
+        pitfalls.append({
+            "code": str(g.value(p, OOPS.hasCode) or ""),
+            "level": str(g.value(p, OOPS.hasImportanceLevel) or "").lower(),
+            "subject": ", ".join(affected),
+            "message": str(g.value(p, OOPS.hasName) or ""),
+            "source": "oops",
+        })
+    return {"available": True, "pitfalls": pitfalls}
+
+
+def validate(project: Project, oops: bool = False, check_data: bool = True) -> ValidationReport:
+    findings: list[Finding] = []
+    content = load_content(project)
+    g = _parse_ttl(project, findings)
+    pitfalls: list[dict[str, Any]] = []
+    oops_result = None
+    if g is not None:
+        _check_terms(content, {c["name"] for c in classes(g)}, findings)
+        pitfalls = native_pitfalls(g)
+        _check_relation_contracts(g, content, project, findings, check_data)
+        _check_metrics(g, content, findings)
+        _check_reserved_names(g, content, findings)
+        _check_source_classes(g, content, findings)
+        if oops:
+            oops_result = oops_scan(project.schema_path.read_text(encoding="utf-8"))
+            pitfalls += oops_result.get("pitfalls", [])
+    coverage = _check_mappings(content, project, findings)
+    _check_precedence(content, findings)
+    _check_questions(content, project, findings)
+    _check_reserved(content, findings)
+    _check_requirements(content, findings)
+    report = ValidationReport(
+        ok=not any(f.level == "error" for f in findings),
+        findings=findings, coverage=coverage, pitfalls=pitfalls, oops=oops_result,
+    )
+    project.validation_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(project.validation_path, report.model_dump_json(indent=2))
+    return report

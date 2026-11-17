@@ -1,0 +1,131 @@
+{
+  "project": "akme-template",
+  "version": "0.1.0",
+  "base_iri": "https://akme.example/ontology#",
+  "classes": [
+    {
+      "name": "Entity",
+      "iri": "https://akme.example/ontology#Entity",
+      "label": "Entidade",
+      "comment": "Coisa do dominio do cliente que tem identidade propria, como cliente, pedido ou produto.",
+      "subclass_of": []
+    },
+    {
+      "name": "Metric",
+      "iri": "https://akme.example/ontology#Metric",
+      "label": "Metrica",
+      "comment": "Medida calculada a partir de dados, com formula e unidade definidas na camada semantica.",
+      "subclass_of": []
+    },
+    {
+      "name": "Relation",
+      "iri": "https://akme.example/ontology#Relation",
+      "label": "Relacao",
+      "comment": "Ligacao reificada entre entidades quando a relacao precisa de atributos proprios, como vigencia ou origem.",
+      "subclass_of": []
+    },
+    {
+      "name": "Rule",
+      "iri": "https://akme.example/ontology#Rule",
+      "label": "Regra",
+      "comment": "Regra de negocio ou restricao que condiciona como entidades e metricas devem ser interpretadas.",
+      "subclass_of": []
+    }
+  ],
+  "relations": [],
+  "relation_contracts": [],
+  "terms": [],
+  "mappings": [],
+  "constraints": [],
+  "glossary": [],
+  "precedence": [],
+  "requirements": {
+    "purpose": "",
+    "scope": "",
+    "users": [],
+    "use_cases": [],
+    "no_use_case": "",
+    "competency_questions": [],
+    "gaps": [],
+    "divergences": []
+  },
+  "pending": [],
+  "requirements_status": {
+    "closed": false,
+    "missing": [
+      "sem caso de uso (ou motivo em requirements.no_use_case)",
+      "nenhuma CQ approved",
+      "purpose ou scope vazios"
+    ],
+    "ontology_empty": true,
+    "gate_active": true
+  },
+  "stage": {
+    "number": 1,
+    "name": "Especificar",
+    "total": 6,
+    "label": "Etapa 1 de 6: Especificar",
+    "missing": [
+      "sem caso de uso (ou motivo em requirements.no_use_case)",
+      "nenhuma CQ approved",
+      "purpose ou scope vazios"
+    ],
+    "next_step": "No chat, peça ao agente o que falta para fechar os requisitos.",
+    "requirements_closed": false,
+    "gate_active": true,
+    "pending_by_stage": {
+      "1": 0,
+      "2": 0,
+      "3": 0,
+      "4": 0,
+      "5": 0,
+      "6": 0
+    },
+    "undecided": 0,
+    "counts": {
+      "classes": 0,
+      "terms": 0,
+      "mappings": 0,
+      "pending": 0
+    },
+    "stages": [
+      {
+        "number": 1,
+        "name": "Especificar",
+        "description": "Caso de uso, perguntas de competência, lacunas e divergências",
+        "status": "active"
+      },
+      {
+        "number": 2,
+        "name": "Conceitualizar",
+        "description": "Classes, relações e termos a partir das CQs aprovadas",
+        "status": "incomplete"
+      },
+      {
+        "number": 3,
+        "name": "Codificar",
+        "description": "Mappings para tabela e coluna, restrições e precedências",
+        "status": "incomplete"
+      },
+      {
+        "number": 4,
+        "name": "Avaliar",
+        "description": "Validate e eval; correções voltam como novas propostas",
+        "status": "incomplete"
+      },
+      {
+        "number": 5,
+        "name": "Publicar",
+        "description": "Export da página e publish em dry-run no alvo",
+        "status": "incomplete"
+      },
+      {
+        "number": 6,
+        "name": "Manter",
+        "description": "Mudanças começam por uma CQ nova e passam pela mesma revisão",
+        "status": "incomplete"
+      }
+    ]
+  },
+  "validation": null
+}

@@ -1,0 +1,71 @@
+name: akme
+version: 0.1.0
+base_iri: https://akme.example/ontology#
+artifacts:
+  schema: schema.ttl
+  content: content.yml
+  changelog: changelog.yml
+  pending: pending/
+
+tools:
+  - name: connect
+    description: Escolhe o adapter em akme.yml e testa a conexao. Lista fontes e documentos com o numero de paginas de cada um. read_document le um documento pagina a pagina ou slide a slide. find_in_sources localiza um termo em documentos e planilhas com caminho, pagina, coluna e trecho.
+    when: Inicio do projeto e sempre que a fonte mudar. read_document sempre que precisar do conteudo completo de um documento; o profile so traz um excerto. find_in_sources antes de mostrar ao humano qualquer hipotese, ambiguidade ou conflito, para citar arquivo, pagina ou coluna e trecho.
+    requires_approval: false
+    output_format: json
+
+  - name: profile
+    description: Colunas, tipos, nulos, cardinalidade, chaves candidatas e convencoes detectadas. Grava docs/profile.json.
+    when: Etapa Especificar, antes de propor termos e mappings.
+    requires_approval: false
+    output_format: json
+
+  - name: ontology_read
+    description: list_entities, list_relations, search_term, resolve_acronym, get_precedence, list_competency_questions, get_requirements, search_registry.
+    when: Sempre que o agente precisar saber o que ja existe; nunca responda de memoria.
+    requires_approval: false
+    output_format: json
+
+  - name: ontology_write
+    description: propose_edit grava em pending/; apply_edit aplica; reject_edit descarta. Tipos add_term, add_mapping, add_constraint, add_glossary, add_precedence, add_class, add_relation, add_competency_question, update_competency_question, remove_competency_question, add_requirement, add_use_case, add_gap, add_divergence, update_gap, update_divergence. Classes, relacoes, termos, mappings, constraints e precedencias sao recusados enquanto os requisitos nao estiverem fechados. add_relation exige multiplicity e join (ou no_join_reason) e confere no dado; termos de Metric exigem unit, grain e additivity; mappings de metrica exigem expression.
+    when: Etapas Especificar, Conceitualizar, Codificar e Manter. apply_edit so apos aprovacao humana explicita.
+    requires_approval: true
+    runs_before: [validate]
+    output_format: yaml
+
+  - name: requirements
+    description: requirements_status devolve closed e a lista do que falta para fechar os requisitos; data_request deriva o pedido de dados das lacunas decididas como request_from_client.
+    when: Antes de iniciar a etapa Conceitualizar e ao fim da etapa Especificar.
+    requires_approval: false
+    output_format: json
+
+  - name: review
+    description: review_edit grava a decisao do humano em uma edicao pendente de qualquer tipo; apply_reviewed aplica em lote as revisadas (stage requirements, ontology ou all), validando antes em copia temporaria. A CLI akme review serve a pagina em 127.0.0.1; open_review roda export, sobe essa pagina em segundo plano e devolve a URL; open_review tambem abre uma rodada de revisao e wait_for_review bloqueia ate o humano aplicar pela pagina (akme wait-review faz o mesmo na CLI); stage diz a etapa atual das seis, o proximo passo e o checklist da etapa. A pagina tambem aplica (botao Aplicar decididas, com nome) e akme apply --all-reviewed --approved-by NOME faz o mesmo na CLI.
+    when: Toda parada em que o humano decide propostas (etapas 1, 2 e 3). apply_reviewed so apos o humano dizer "aplica" com o nome de quem aprova, ou constatar que ele aplicou pela pagina.
+    requires_approval: true
+    runs_before: [validate]
+    output_format: json
+
+  - name: validate
+    description: TTL parseia, classes referenciadas existem, mappings apontam para colunas do profile, conflitos de precedencia, cobertura e pitfalls (nativos e OOPS! opcional). Grava docs/validation.json.
+    when: Antes de todo apply_edit e na etapa Avaliar.
+    requires_approval: false
+    output_format: json
+
+  - name: eval
+    description: Roda validation/questions.yml com testes estruturais e, via CLI, a comparacao com e sem ontologia usando um callable do usuario.
+    when: Etapa Avaliar e depois de cada release.
+    requires_approval: false
+    output_format: table
+
+  - name: publish
+    description: Gera semantic view e comments para Snowflake, comments do Unity Catalog para Databricks, YAML generico ou RDF via Morph-KGC. Dry-run por padrao; --release faz o bump de versao.
+    when: Etapa Publicar, apos validate e eval aprovados.
+    requires_approval: true
+    output_format: sql
+
+  - name: export
+    description: Gera docs/ontology.json, docs/ontology.js, docs/ontology.mmd e ontology/mappings.yarrrml.yml.
+    when: Etapa Publicar e sempre que quiser ver o grafo em docs/index.html.
+    requires_approval: false
+    output_format: json

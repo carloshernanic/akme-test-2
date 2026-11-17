@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+from typing import Any
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from .project import CONFIG_FILE, Project, read_yaml, write_yaml
+from .tools import catalog as catalog_tool
+from .tools import connect as connect_tool
+from .tools import eval as eval_tool
+from .tools import export as export_tool
+from .tools import neo4j_load as neo4j_tool
+from .tools import neo4j_plan as neo4j_plan_tool
+from .tools import ontology_write as write_tool
+from .tools import profile as profile_tool
+from .tools import publish as publish_tool
+from .tools import validate as validate_tool
+
+app = typer.Typer(help="AKME: ontologia e camada semantica com LOT + NeOn e humano no loop", no_args_is_help=True)
+console = Console()
+
+TEMPLATE_FILES = ("schema.ttl", "content.yml", "manifest.yml")
+
+
+def _project() -> Project:
+    p = Project(".")
+    if not p.config:
+        console.print(f"[yellow]{CONFIG_FILE} nao encontrado; rode 'akme init'. Usando padroes.[/]")
+    return p
+
+
+def _dump(data: Any) -> None:
+    console.print_json(json.dumps(data, ensure_ascii=False, default=str))
+
+
+@app.command()
+def init(adapter: str = typer.Option("local_folder", help="local_folder, postgres, snowflake ou databricks"),
+         path: str = typer.Option(None, help="pasta dos dados para local_folder (padrao: data, ou examples/local_demo com --demo)"),
+         demo: bool = typer.Option(False, help="usa uma copia da ontologia em examples/local_demo/ontology")) -> None:
+    """Cria akme.yml e as pastas de trabalho."""
+    config: dict[str, Any] = {"project": Path.cwd().name, "adapter": adapter}
+    path = path or ("examples/local_demo" if demo else "data")
+    options = {
+        "local_folder": {"path": path},
+        "postgres": {"dsn": "env:AKME_PG_DSN", "schema": "public"},
+        "snowflake": {"account": "env:AKME_SNOWFLAKE_ACCOUNT", "user": "env:AKME_SNOWFLAKE_USER",
+                      "password": "env:AKME_SNOWFLAKE_PASSWORD", "warehouse": "env:AKME_SNOWFLAKE_WAREHOUSE",
+                      "database": "env:AKME_SNOWFLAKE_DATABASE", "schema": "env:AKME_SNOWFLAKE_SCHEMA"},
+        "databricks": {"host": "env:AKME_DATABRICKS_HOST", "http_path": "env:AKME_DATABRICKS_HTTP_PATH",
+                       "token": "env:AKME_DATABRICKS_TOKEN", "catalog": "env:AKME_DATABRICKS_CATALOG",
+                       "schema": "env:AKME_DATABRICKS_SCHEMA"},
+    }
+    config[adapter] = options[adapter]
+    if demo:
+        config["project"] = "local_demo"
+        config["ontology_dir"] = "examples/local_demo/ontology"
+        config["questions"] = "examples/local_demo/questions.yml"
+        target = Path("examples/local_demo/ontology")
+        target.mkdir(parents=True, exist_ok=True)
+        for name in TEMPLATE_FILES:
+            if not (target / name).exists():
+                shutil.copy(Path("ontology") / name, target / name)
+    write_yaml(Path(CONFIG_FILE), config)
+    if adapter == "local_folder":
+        Path(path).mkdir(parents=True, exist_ok=True)
+    Path(config.get("ontology_dir", "ontology"), "pending").mkdir(parents=True, exist_ok=True)
+    Path("docs").mkdir(exist_ok=True)
+    console.print(f"[green]{CONFIG_FILE} criado[/] com adapter {adapter}")
+    if adapter == "databricks":
+        _inventory_databricks()
+
+
+def _inventory_databricks() -> None:
+    """Com as credenciais preenchidas, grava o inventario de catalogos, schemas e tabelas da conta."""
+    project = Project(".")
+    missing = catalog_tool.missing_credentials(project)
+    if missing:
+        console.print(f"[yellow]inventario do Databricks nao gerado: credenciais vazias ({', '.join(missing)}). "
+                      "Preencha o .env e rode 'akme init --adapter databricks' de novo.[/]")
+        return
+    console.print("listando catalogos, schemas e tabelas do Databricks...")
+    try:
+        result = catalog_tool.discover_catalog(project)
+    except Exception as exc:  # init nao deve falhar por causa do inventario
+        console.print(f"[red]inventario do Databricks falhou:[/] {exc}")
+        return
+    s = result["summary"]
+    console.print(f"[green]{project.catalog_path.relative_to(project.root).as_posix()} gravado[/]: "
+                  f"{s['catalogs']} catalogos, {s['schemas']} schemas, {s['tables']} tabelas")
+    if s["errors"]:
+        console.print(f"[yellow]{s['errors']} locais sem acesso; veja 'errors' no arquivo[/]")
+
+
+@app.command()
+def reset(yes: bool = typer.Option(False, "--yes", "-y", help="nao pede confirmacao")) -> None:
+    """Apaga a ontologia atual para comecar outra do zero. Antes guarda uma copia em backups/."""
+    from .tools import reset as reset_tool
+
+    project = _project()
+    if not project.ontology_dir.is_dir():
+        console.print(f"[red]pasta da ontologia nao encontrada:[/] {project.ontology_dir}")
+        raise typer.Exit(1)
+    s = reset_tool.summary(project)
+    console.print(f"Ontologia em [bold]{project.ontology_dir.relative_to(project.root).as_posix()}[/]: "
+                  f"{s['competency_questions']} perguntas de competencia, {s['use_cases']} casos de uso, "
+                  f"{s['terms']} termos, {s['mappings']} mappings, {s['pending']} propostas pendentes.")
+    console.print("Classes, relacoes, requisitos, changelog, propostas pendentes e a conversa da pagina serao apagados. "
+                  "Pare o 'akme review' e o agente antes de continuar.")
+    if not yes and not typer.confirm("Apagar e comecar do zero?", default=False):
+        console.print("nada foi alterado")
+        raise typer.Exit(0)
+    out = reset_tool.reset_ontology(project)
+    console.print(f"[green]ontologia em branco[/] em {out['ontology_dir']}; copia da anterior em {out['backup']}")
+    console.print("Rode 'akme export' para atualizar os arquivos gerados em docs/.")
+
+
+@app.command()
+def connect() -> None:
+    """Testa a conexao com o adapter configurado."""
+    _dump(connect_tool.connect(_project()))
+
+
+@app.command()
+def profile(sample_size: int = 500) -> None:
+    """Perfila as fontes e grava docs/profile.json."""
+    result = profile_tool.profile(_project(), sample_size)
+    table = Table(title="Profile", show_lines=False)
+    for col in ("fonte", "linhas", "colunas", "chaves candidatas"):
+        table.add_column(col)
+    for s in result.sources:
+        table.add_row(s.name, str(s.rows_sampled), str(len(s.columns)), ", ".join(s.candidate_keys) or "-")
+    console.print(table)
+    console.print("convencoes:", result.conventions)
+
+
+@app.command()
+def validate(oops: bool = typer.Option(False, help="chama o OOPS! remoto alem dos pitfalls nativos")) -> None:
+    """Valida a ontologia e grava docs/validation.json."""
+    report = validate_tool.validate(_project(), oops)
+    table = Table(title="Validate")
+    table.add_column("nivel")
+    table.add_column("check")
+    table.add_column("mensagem")
+    for f in report.findings:
+        table.add_row(f.level, f.check, f.message)
+    for p in report.pitfalls:
+        table.add_row(f"pitfall {p['level']}", f"{p['code']} ({p['source']})", f"{p['subject']}: {p['message']}")
+    console.print(table)
+    cov = report.coverage
+    if cov.get("available"):
+        console.print(f"cobertura: {cov['mapped']}/{cov['columns']} colunas mapeadas ({cov['ratio']:.0%})")
+    console.print("[green]ok[/]" if report.ok else "[red]erros encontrados[/]")
+    raise typer.Exit(code=0 if report.ok else 1)
+
+
+def _publish_neo4j(release: str | None) -> None:
+    """Mostra destino e avisos antes de confirmar; a carga termina com erro se o banco divergir."""
+    project = _project()
+    try:
+        typer.echo(f"destino: {neo4j_tool.destination()}")
+        plan = neo4j_plan_tool.build_plan(project)  # um plano so: previa, estado do banco e carga o reaproveitam
+        preview = publish_tool.publish(project, "neo4j", True, None, plan)
+        if preview["problems"]:
+            for line in neo4j_tool.preview_lines(preview):
+                typer.echo(line)
+            raise typer.Exit(1)
+        typer.echo("consultando estado atual do banco Neo4j...")
+        state = neo4j_tool.destination_state(project, plan)
+        for line in neo4j_tool.preview_lines(preview, state):
+            typer.echo(line)
+        described, refusal = neo4j_tool.check_destination(state, project.name)
+        typer.echo(f"banco: {described}")
+        if refusal:
+            typer.echo(f"erro: {refusal}. Nada foi gravado")
+            raise typer.Exit(1)
+        if not typer.confirm("Executar no alvo neo4j? Esta acao altera a plataforma do cliente."):
+            raise typer.Abort()
+        removed = neo4j_tool.large_removal(preview, state)
+        if removed:  # remocao grande: origem truncada por engano apagaria o label; pede o numero, nao um y
+            typed = typer.prompt(f"A sincronizacao apaga mais de {neo4j_tool.LARGE_REMOVAL:.0%} de algum label. "
+                                 f"Para confirmar, digite {removed} (total previsto de nos removidos)",
+                                 default="", show_default=False)
+            if typed.strip() != str(removed):
+                typer.echo(f"erro: confirmacao diferente de {removed}; nada foi gravado")
+                raise typer.Exit(1)
+        typer.echo("iniciando publicacao no Neo4j...")
+        result = publish_tool.publish(project, "neo4j", False, release, plan)
+        _dump(result)
+        for line in neo4j_tool.viewing_lines(project, result):
+            typer.echo(line)
+    except (typer.Abort, typer.Exit):
+        raise
+    except (RuntimeError, publish_tool.PublishError) as exc:
+        typer.echo(f"erro: {neo4j_tool._safe(exc, neo4j_tool._adapter_secrets(project))}")
+        raise typer.Exit(1) from None
+    except Exception as exc:  # inesperado (CSV em outra codificacao, csv.Error, driver do banco): curto, sem credencial
+        typer.echo(f"erro: {type(exc).__name__}: {neo4j_tool._safe(exc, neo4j_tool._adapter_secrets(project))}")
+        raise typer.Exit(1) from None
+
+
+@app.command()
+def publish(target: str = typer.Option("yaml", help="yaml, snowflake, databricks, rdf ou neo4j"),
+            dry_run: bool = typer.Option(True, help="--no-dry-run executa no alvo"),
+            release: str = typer.Option(None, help="patch, minor, major ou versao explicita")) -> None:
+    """Gera (ou executa) a publicacao da camada semantica. Dry-run por padrao."""
+    if target == "neo4j" and not dry_run:
+        _publish_neo4j(release)
+        return
+    if not dry_run and not typer.confirm(f"Executar no alvo {target}? Esta acao altera a plataforma do cliente."):
+        raise typer.Abort()
+    result = publish_tool.publish(_project(), target, dry_run, release)
+    _dump(result)
+    if target == "neo4j":  # dry-run tambem gera o tutorial do Browser: diz como abrir
+        from .tools.neo4j_guide import guide_lines
+        for line in guide_lines():
+            typer.echo(line)
+
+
+@app.command(name="eval")
+def eval_cmd(callable: str = typer.Option(None, "--callable", help="modulo:funcao que responde (pergunta, contexto)")) -> None:
+    """Roda as perguntas de validation/questions.yml com e sem ontologia."""
+    fn = eval_tool.load_callable(callable) if callable else None
+    result = eval_tool.evaluate(_project(), fn)
+    table = Table(title="Eval")
+    cols = ["id", "pergunta", "estrutural"] + (["sem ontologia", "com ontologia"] if fn else [])
+    for c in cols:
+        table.add_column(c)
+    for r in result["rows"]:
+        row = [str(r["id"]), str(r["question"]), r["structural"]]
+        if fn:
+            row += [_mark(r.get("without_correct"), r.get("without_ontology")), _mark(r.get("with_correct"), r.get("with_ontology"))]
+        table.add_row(*row)
+    console.print(table)
+    console.print(result["summary"])
+
+
+def _mark(correct: bool | None, answer: str | None) -> str:
+    prefix = "" if correct is None else ("[green]ok[/] " if correct else "[red]x[/] ")
+    return prefix + (answer or "")[:60]
+
+
+@app.command()
+def export() -> None:
+    """Gera docs/ontology.json e demais artefatos derivados."""
+    _dump(export_tool.export(_project()))
+
+
+@app.command()
+def seed(file: Path, approved_by: str = typer.Option(..., help="quem aprova cada edicao da lista")) -> None:
+    """Propoe e aplica uma lista de edicoes de um YAML. Util para demos e migracoes ja revisadas."""
+    project = _project()
+    edits = read_yaml(file).get("edits") or []
+    for e in edits:
+        edit = write_tool.propose_edit(project, e["type"], e["payload"], e.get("rationale", ""),
+                                       e.get("proposed_by", "seed"), e.get("requirement_id"), e.get("evidence", ""))
+        write_tool.apply_edit(project, edit.id, approved_by)
+    console.print(f"[green]{len(edits)} edicoes aplicadas[/] aprovadas por {approved_by}")
+
+
+@app.command()
+def pending() -> None:
+    """Lista as edicoes aguardando aprovacao."""
+    console.print(write_tool.pending_summary(_project()) or "nenhuma edicao pendente")
+
+
+@app.command()
+def apply(edit_id: str = typer.Argument(None, help="id da edicao pendente"),
+          approved_by: str = typer.Option(..., help="nome de quem aprovou"),
+          all_reviewed: bool = typer.Option(False, "--all-reviewed", help="aplica em lote todos os pendentes revisados"),
+          stage: str = typer.Option("all", help="com --all-reviewed: requirements, ontology ou all")) -> None:
+    """Aplica uma edicao pendente (ou, com --all-reviewed, todas as revisadas) apos aprovacao humana."""
+    if all_reviewed:
+        _dump(write_tool.apply_reviewed(_project(), approved_by, stage))
+    elif edit_id:
+        _dump(write_tool.apply_edit(_project(), edit_id, approved_by))
+    else:
+        raise typer.BadParameter("informe o edit_id ou use --all-reviewed")
+
+
+@app.command()
+def demo() -> None:
+    """Roda a demo local: connect, profile, seed, validate, export."""
+    project = _project()
+    _dump(connect_tool.connect(project))
+    profile_tool.profile(project)
+    seed_file = Path("examples/local_demo/seed_edits.yml")
+    if seed_file.exists() and not read_yaml(project.content_path).get("terms"):
+        for e in read_yaml(seed_file).get("edits") or []:
+            edit = write_tool.propose_edit(project, e["type"], e["payload"], e.get("rationale", ""),
+                                           e.get("proposed_by", "seed"), e.get("requirement_id"), e.get("evidence", ""))
+            write_tool.apply_edit(project, edit.id, "demo")
+    report = validate_tool.validate(project)
+    console.print(f"validate: {'ok' if report.ok else 'erros'}, {len(report.pitfalls)} pitfalls, cobertura {report.coverage.get('ratio')}")
+    _dump(export_tool.export(project))
+    console.print("rode 'uv run akme review' e abra a URL local para ver a pagina")
+
+
+@app.command()
+def review(
+    port: int = typer.Option(8765, "--port", help="Porta local"),
+    open_browser: bool = typer.Option(True, "--open/--no-open", help="Abrir o navegador"),
+    background: bool = typer.Option(False, "--background", help="Sobe o servidor em segundo plano (ou reaproveita o que ja estiver no ar) e imprime a URL"),
+) -> None:
+    """Sobe a pagina local de revisao: decisoes sobre as propostas do agente em qualquer etapa."""
+    from .review_server import ensure_running, serve as serve_review
+    project = _project()
+    export_tool.export(project)
+    if background:
+        from .tools.review_round import open_round
+        try:
+            url = ensure_running(project, port, open_browser)
+        except RuntimeError as exc:
+            typer.echo(f"erro: {exc}")
+            raise typer.Exit(1) from None
+        console.print(f"{url} (rodada {open_round(project)['id']})")
+        return
+    try:
+        serve_review(project, port, open_browser)
+    except RuntimeError as exc:  # servidor de codigo antigo na porta: o humano para e roda de novo
+        typer.echo(f"erro: {exc}")
+        raise typer.Exit(1) from None
+
+
+@app.command("wait-review")
+def wait_review(
+    round_id: str = typer.Option("", "--round", help="id da rodada devolvido por open_review"),
+    timeout: float = typer.Option(0, "--timeout", help="segundos; 0 espera ate o humano aplicar"),
+) -> None:
+    """Espera o humano aplicar as decisoes na pagina de revisao e imprime o resumo (para rodar em segundo plano)."""
+    from .tools.review_round import WAIT_MAX, wait_for_review
+    project = _project()
+    while True:
+        out = wait_for_review(project, round_id or None, timeout or WAIT_MAX)
+        if out["status"] != "waiting" or timeout:
+            break
+    _dump(out)
+
+
+@app.command()
+def stage() -> None:
+    """Diz em que etapa das seis o projeto esta, o que falta e o proximo passo."""
+    from .tools.stage import current_stage
+    _dump(current_stage(_project()))
+
+
+@app.command()
+def serve() -> None:
+    """Sobe o servidor MCP (stdio)."""
+    from .server import main
+    main()
+
+
+if __name__ == "__main__":
+    app()

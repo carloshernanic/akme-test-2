@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+from typing import Any
+
+from ..adapters import AdapterError, load_adapter
+from ..ontology import classes, load_content, load_graph, load_manifest, relations
+from ..project import Project, read_yaml, write_yaml
+
+
+_FLIP = {"many_to_one": "one_to_many", "one_to_many": "many_to_one"}
+
+
+def _inverse_contract(c: dict[str, Any]) -> dict[str, Any]:
+    """Contrato da inversa: mesma relacao lida de range para domain."""
+    out = {"relation": c["inverse_of"], "inverse_of_contract": c["relation"],
+           "multiplicity": _FLIP.get(c["multiplicity"], c["multiplicity"])}
+    if c.get("join"):
+        out["join"] = {"from": c["join"]["to"], "to": c["join"]["from"]}
+    if c.get("no_join_reason"):
+        out["no_join_reason"] = c["no_join_reason"]
+    return out
+
+
+def build_export(project: Project) -> dict[str, Any]:
+    g = load_graph(project.schema_path)
+    content = load_content(project)
+    manifest = load_manifest(project)
+    from .ontology_write import list_pending
+    from .requirements import requirements_status
+    from .review_view import present
+    from .stage import current_stage
+
+    validation = read_yaml(project.validation_path) if project.validation_path.exists() else None
+    summary = None
+    if validation:
+        summary = {
+            "generated_at": validation.get("generated_at"),
+            "ok": validation.get("ok"),
+            "errors": sum(1 for f in validation.get("findings", []) if f.get("level") == "error"),
+            "warnings": sum(1 for f in validation.get("findings", []) if f.get("level") == "warning"),
+            "coverage": validation.get("coverage"),
+            "pitfalls": validation.get("pitfalls", []),
+            "findings": validation.get("findings", []),
+        }
+    contracts = {c["relation"]: c for c in content["relation_contracts"]}
+    for c in content["relation_contracts"]:
+        if c.get("inverse_of") and c["inverse_of"] not in contracts:
+            contracts[c["inverse_of"]] = _inverse_contract(c)
+    rels = []
+    for r in relations(g):
+        c = contracts.get(r["name"])
+        rels.append(r | {"contract": {k: v for k, v in c.items() if k != "relation"}} if c else r)
+    return {
+        "project": project.name,
+        "version": manifest.get("version", "0.0.0"),
+        "base_iri": manifest.get("base_iri"),
+        "classes": classes(g),
+        "relations": rels,
+        "relation_contracts": content["relation_contracts"],
+        "terms": content["terms"],
+        "mappings": content["mappings"],
+        "constraints": content["constraints"],
+        "glossary": content["glossary"],
+        "precedence": content["precedence"],
+        "requirements": content["requirements"],
+        "pending": [e.model_dump(mode="json") | {"view": present(e)} for e in list_pending(project)],
+        "requirements_status": requirements_status(project),
+        "stage": current_stage(project),
+        "validation": summary,
+    }
+
+
+def to_mermaid(data: dict[str, Any]) -> str:
+    lines = ["classDiagram"]
+    for c in data["classes"]:
+        lines.append(f"    class {c['name']}")
+        for parent in c["subclass_of"]:
+            lines.append(f"    {parent} <|-- {c['name']}")
+    for r in data["relations"]:
+        for d in r["domain"]:
+            for rg in r["range"]:
+                lines.append(f"    {d} --> {rg} : {r['name']}")
+    return "\n".join(lines) + "\n"
+
+
+def _csv_files(project: Project) -> dict[str, str] | None:
+    if project.adapter_name != "local_folder":
+        return None
+    try:
+        adapter = load_adapter(project.adapter_name, project.adapter_options())
+        locations = {s: adapter.source_location(s) for s in adapter.list_sources()}
+    except AdapterError:
+        return None
+    return {s: loc["file"].as_posix() for s, loc in locations.items() if loc["file"].suffix.lower() == ".csv"}
+
+
+def to_yarrrml(project: Project, data: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    base = data.get("base_iri") or "https://akme.example/ontology#"
+    files = _csv_files(project)
+    source_dir = project.adapter_options().get("path", ".")
+    term_class = {t["name"]: t.get("class") for t in data["terms"]}
+    mappings: dict[str, Any] = {}
+    skipped: list[str] = []
+    for m in data["mappings"]:
+        source = m["source"]
+        if files is not None and source not in files:
+            if source not in skipped:
+                skipped.append(source)
+            continue
+        access = files[source] if files is not None else f"{source_dir}/{source}.csv"
+        entry = mappings.setdefault(source, {
+            "sources": [{"access": access, "referenceFormulation": "csv"}],
+            "s": f"{base}{source}/$({m['column']})",
+            "po": [],
+        })
+        cls = term_class.get(m["term"])
+        if cls and ["a", f"akme:{cls}"] not in entry["po"]:
+            entry["po"].append(["a", f"akme:{cls}"])
+        entry["po"].append([f"akme:{m['term']}", f"$({m['column']})"])
+    return {"prefixes": {"akme": base}, "mappings": mappings}, skipped
+
+
+PAGE_DIR = Path(__file__).resolve().parent.parent / "static"
+PAGE_FILES = ("index.html", "akme.css", "app.js", "graph.js", "etapa1.js", "outras.js", "review.js", "exportar.js", "chat.js")
+PAGE_DIRS = ("fonts", "brand")
+
+
+def sync_page(project: Project) -> list[str]:
+    """Copia a pagina (HTML, CSS, JS, fontes e marca) do pacote para docs/ quando falta ou mudou.
+    A fonte de verdade e akme/static/; docs/ fica com a copia que o navegador abre."""
+    copied: list[str] = []
+    targets: list[tuple[Path, Path]] = [(PAGE_DIR / f, project.docs_dir / f) for f in PAGE_FILES]
+    for d in PAGE_DIRS:
+        targets += [(src, project.docs_dir / d / src.name) for src in sorted((PAGE_DIR / d).glob("*")) if src.is_file()]
+    for src, dst in targets:
+        if not src.exists():
+            continue
+        if dst.exists() and dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        copied.append(dst.name)
+    return copied
+
+
+def export(project: Project) -> dict[str, Any]:
+    data = build_export(project)
+    project.docs_dir.mkdir(parents=True, exist_ok=True)
+    page = sync_page(project)
+    json_path = project.docs_dir / "ontology.json"
+    json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    js_path = project.docs_dir / "ontology.js"
+    js_path.write_text("window.AKME_DATA = " + json.dumps(data, ensure_ascii=False) + ";\n", encoding="utf-8")
+    mmd_path = project.docs_dir / "ontology.mmd"
+    mmd_path.write_text(to_mermaid(data), encoding="utf-8")
+    yarrrml_path = project.ontology_dir / "mappings.yarrrml.yml"
+    yarrrml, skipped = to_yarrrml(project, data)
+    write_yaml(yarrrml_path, yarrrml)
+    return {"json": str(json_path), "mermaid": str(mmd_path), "yarrrml": str(yarrrml_path), "yarrrml_skipped": skipped,
+            "page": str(project.docs_dir / "index.html"), "page_updated": page,
+            "classes": len(data["classes"]), "relations": len(data["relations"]), "terms": len(data["terms"])}
